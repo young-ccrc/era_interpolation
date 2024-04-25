@@ -1,0 +1,31 @@
+#!/bin/bash
+
+cat > interpolation_%input_var%_%syear%.pbs << EOF_Interp
+
+#!/bin/bash
+#PBS -m ae
+#PBS -P %project%
+#PBS -q normal
+#PBS -l walltime=%walltime%:00:00
+#PBS -l mem=%memory%GB
+#PBS -l ncpus=%ncores%
+#PBS -j oe
+#PBS -l wd
+#PBS -l storage=%storage%
+echo "Starting time:"
+date
+
+echo "Module load"
+module use /g/data3/hh5/public/modules
+module load conda/analysis3
+
+echo "Starting interpolation"
+python era5_3d_h_v_interpolation_batch.py --yp %yamlfile% --var %input_var% --sy %syear% --ey %eyear%
+
+./runInterp_%input_var%_%eyear%.deck
+
+echo "Ending time:"
+date
+EOF_Interp
+
+qsub interpolation_%input_var%_%syear%.pbs
