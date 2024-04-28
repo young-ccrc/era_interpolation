@@ -1,0 +1,113 @@
+# =============== Input for interpolation =========================
+# File path -------------------------------------------------
+input_path: "/g/data/rt52/era5/pressure-levels/reanalysis"  # Path to the ERA5 reanalysis data
+target_path: "/g/data/oi10/replicas/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r1i1p1f2" # Path to the GCM data
+output_path: "/scratch/dm6/yk8692/interpolation/tested_v2"  # Path to save the output files
+
+# Input variable names --------------------------------------------
+input_variables: ["q", "t", "u", "v"]  # 3D variables of ERA5
+target_variables: ["hus", "ta", "ua", "va"]  # 3D variables of GCM
+
+# GCM informatin --------------------------------------------------
+infor: "6hrLev"
+gname: "CNRM-CM6-1"  # EC-Earth3-Veg, ACCESS-ESM1-5
+period: "historical"
+cinfor: "r1i1p1f2"  # r1i1p1f1
+sinfor: "gr"  # gn, gr
+version: "v20180917"  # v20180917, v20191115
+
+# Selected area ---------------------------------------------------
+# latitudes and longitudes of the selected area
+lat_min: -55
+lat_max: -5
+lon_min: 80
+lon_max: 170
+
+# Simulation periods ----------------------------------------------
+startyear_h: 1982
+endyear_h: 2012
+
+# =============== Input for interpolation ended =========================
+
+# =============== Input for bias correction =========================
+# File path -------------------------------------------------
+# bc_hist_path: "/g/data/oi10/replicas/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r1i1p1f1/6hrLev"
+bc_hist_path: "/g/data/fs38/publications/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r1i1p1f1/6hrLev"
+bc_future_path: "/g/data/fs38/publications/CMIP6/ScenarioMIP/CSIRO/ACCESS-ESM1-5/ssp126/r6i1p1f1/6hrLev"
+# obs_path: "/g/data/w28/yk8692/era5/"
+input_path: "/g/data/rt52/era5/pressure-levels/reanalysis"  # Path to the ERA5 reanalysis data
+
+out_path: "/scratch/dm6/yk8692/sdmbc/"
+out_figure_path: "/scratch/dm6/yk8692/sdmbc/"
+gcm_path: "/srv/ccrc/NARCliM2/bdy/GCM/EC-Earth3-Veg/historical"
+
+bc_boundary: "lateral"
+
+# Input variable names --------------------------------------------
+origin_vargcm_3d: ["hus", "ta", "ua", "va"]
+origin_vargcm_2d: ["tos"]
+input_vargcm_3d: ["q", "t", "u", "v"]
+input_vargcm_2d: ["sst"]
+
+# historical
+# infor: "6hrLev"
+# gname: "ACCESS-ESM1-5" # ACCESS-ESM1-5, EC-Earth3-Veg
+# period: "historical"
+# cinfor: "r1i1p1f1"
+# sinfor: "gn" # "gr"
+# version: "20191115"
+
+# future
+scenario: "ssp126"
+cinfor_f: "r6i1p1f1"
+version_f: "20211213"
+
+# Simulation periods, historical -----------------------------------
+bc_hist: True # Yes: True, No: False
+startyear_h: 1982
+endyear_h: 2012
+starty_sfc_h: 1980
+endy_sfc_h: 2012
+
+# Simulation periods, future -----------------------------------
+bc_future: True # Yes: True, No: False
+startyear_f: 1982
+endyear_f: 2100
+starty_sfc_f: 1980
+endy_sfc_f: 2100
+
+# Bias correction information -------------------------------------
+level: 1
+tlevel: 38
+no_of_variables: 3
+time_scale: 0
+no_of_iterations: 1
+missing_value: 0.00001
+
+# lat_min: -11
+# lat_max: -10
+# lon_min: 128
+# lon_max: 134
+# lat_min: -45
+# lat_max: -10
+# lon_min: 80
+# lon_max: 130
+
+# lon_range: [1, 6]
+# lat_range: [1, 9]
+
+moving_window: 15 # centred moving window if input data is at daily time scale
+correction_model: 4 # 1: mean, 2: mean and variance, 3: nested, 4: multivariate
+sub_daily_correction: False # sub-daily bias correction, Yes: True, No: False
+
+# Physical upper limit (specific humidity (g/kg), temperature (K), wind speed (m/s), sea surface temperature (K))
+# upper_limit: [100, 330, 190, 330]
+# lower_limit: [0.001, 137, 0.001, 270]
+# Physical upper limit (wind speed (m/s), temperature (K), specific humidity (g/kg), sea surface temperature (K))
+upper_limit: [190, 330, 100, 330]
+lower_limit: [0.001, 137, 0.001, 270]
+
+# Options for bias correction
+draw_figure: true
+reformat_to_original: true
+# =============== Input for bias correction ended =========================
