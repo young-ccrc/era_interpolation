@@ -45,8 +45,8 @@ project2 = "w28"
 outproject = "dm6"
 
 # Computing resources
-ncores = 28  # number of cores
-memory = 126  # in GB
+ncores = 96  # number of cores
+memory = 378  # in GB
 walltime = 2  # in hours
 
 # Email: to receive an email at the end of each script
