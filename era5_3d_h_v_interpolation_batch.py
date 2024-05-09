@@ -33,7 +33,7 @@ import xarray as xr  # type: ignore
 import xesmf as xe  # type: ignore
 import yaml  # type: ignore
 from dask.diagnostics import ProgressBar  # type: ignore
-from dask.distributed import Client, LocalCluster  # type: ignore
+from dask.distributed import Client  # type: ignore
 from scipy.interpolate import interp1d  # type: ignore
 
 warnings.simplefilter("ignore", UserWarning)
@@ -60,7 +60,7 @@ class Config:
         self.__dict__.update(entries)
 
 
-def setup_client(n_workers=None, threads_per_worker=None):
+def setup_client(n_workers=None):
     """
     Set up Dask client for parallel processing, allowing customization of workers and threads.
 
@@ -71,10 +71,10 @@ def setup_client(n_workers=None, threads_per_worker=None):
     Returns:
         Client: A Dask distributed client instance.
     """
-    if n_workers is None or threads_per_worker is None:
+    if n_workers is None:
         c = Client()
     else:
-        c = Client(n_workers=n_workers, threads_per_worker=threads_per_worker)
+        c = Client(n_workers=n_workers)
     print("Dask client setup complete.")
     return c
 
@@ -99,64 +99,46 @@ def parse_arguments():
         default=["hus", "ta", "ua", "va"],
         help="Path to the YAML configuration file.",
     )
-    parser.add_argument(
-        "--nc",
-        type=int,
-        default=28,
-        help="Number of cores to use.",
-    )
 
-    parser.add_argument(
-        "--mp",
-        type=int,
-        default=64,
-        help="Amount of RAM (in GB) to allocate.",
-    )
-
-    parser.add_argument(
-        "--np",
-        type=int,
-        default=4,
-        help="Number of multiprocessing processes to use.",
-    )
-    parser.add_argument(
-        "--mpp",
-        type=int,
-        default=32,
-        help="Amount of RAM (in GB) to allocate per process.",
-    )
     parser.add_argument("--sy", type=int, default=1982, help="Start year.")
     parser.add_argument("--ey", type=int, default=2012, help="End year.")
 
     return parser.parse_args()
 
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+def standardize_dims(ds):
+    standard_names = ["time", "lat", "lon", "lev"]
+    used_names = set(ds.dims) & set(
+        standard_names
+    )  # Find intersection of existing and standard names
+    dim_map = {}
 
+    # Function to guess dimension type based on data
+    def guess_dim_type(dim):
+        if ds[dim].dtype == "datetime64[ns]":
+            return "time"
+        elif "lat" in dim.lower() or (ds[dim].max() <= 90 and ds[dim].min() >= -90):
+            return "lat"
+        elif "lon" in dim.lower() or (ds[dim].max() <= 180 and ds[dim].min() >= -180):
+            return "lon"
+        elif (
+            "lev" in dim.lower()
+            or "level" in dim.lower()
+            or "height" in dim.lower()
+            or "depth" in dim.lower()
+        ):
+            return "lev"
+        return None
 
-def robust_open_dataset(file_pattern):
-    """
-    Safely open a dataset with error handling.
+    # Attempt to map each dimension to a standard name if applicable
+    for dim in ds.dims:
+        if dim not in used_names:
+            suggested_name = guess_dim_type(dim)
+            if suggested_name and suggested_name not in used_names:
+                dim_map[dim] = suggested_name
+                used_names.add(suggested_name)  # Mark this standard name as used
 
-    Args:
-        file_pattern (str): Glob pattern for files to load.
-
-    Returns:
-        xarray.Dataset: The opened dataset.
-    """
-    try:
-        dataset = xr.open_mfdataset(file_pattern, combine="by_coords")
-    except FileNotFoundError:
-        logging.error(f"No files found with the pattern: {file_pattern}")
-        raise
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        raise
-    # logging.info(f"Dataset loaded successfully from {file_pattern}")
-    return dataset
+    return ds.rename_dims(dim_map)
 
 
 # Define functions for the horizontal and vertical interpolation ----------------
@@ -417,296 +399,34 @@ def regrid(source_ds, target_ds, method, weights_path, rename_dict):
         raise TypeError("Input must be xarray DataArray or Dataset")
 
 
-def preprocess_month(ds, year, month):
-    """
-    Preprocess function to select data for a specific year and month.
+def standardize_coords(ds):
+    # Define the desired name mappings
+    coord_map = {"lon": "longitude", "lat": "latitude", "lev": "level"}
+    # Prepare to modify the dataset
+    new_ds = ds.copy()
 
-    Parameters:
-    - ds (xarray.Dataset): Dataset to preprocess.
-    - year (int): Year to filter.
-    - month (int): Month to filter.
+    # Check and handle each coordinate in the map
+    for old_name, new_name in coord_map.items():
+        if old_name in new_ds.coords:
+            if new_name in new_ds.coords:
+                # Both old and new coordinates exist
+                # print(f"Both '{old_name}' and '{new_name}' exist.")
+                # Check if they are identical to decide on merging or replacing
+                if xr.all(new_ds[old_name] == new_ds[new_name]):
+                    # If identical, drop the old coordinate
+                    new_ds = new_ds.drop_vars(old_name)
+                    # print(f"Dropped '{old_name}' as it is identical to '{new_name}'.")
+                # else:
+                # If not identical, consider how to merge or rename to avoid conflict
+                # print(f"Coordinates '{old_name}' and '{new_name}' are not identical. Consider merging or manually handling.")
+            else:
+                # Safe to rename as the new name does not exist
+                new_ds = new_ds.rename({old_name: new_name})
+                # print(f"Renamed '{old_name}' to '{new_name}'.")
+        # else:
+        # print(f"'{old_name}' not found in the coordinates; no changes made.")
 
-    Returns:
-    - xarray.Dataset: Preprocessed dataset.
-    """
-    # Convert `time` to a datetime index if not already done
-    # ds["time"] = xr.decode_cf(ds)["time"]
-
-    # Filter the dataset for the specified year and month
-    ds_filtered = ds.sel(time=(ds["time.year"] == year) & (ds["time.month"] == month))
-    return ds_filtered
-
-
-def process_data_parallel(year, config):
-    # client = setup_dask(config.memory_per_process, config.num_cores_per_process)
-    # client = setup_dask(config.memory_per_process, config.num_cores_per_process, 1)
-
-    lat_max = config.lat_max
-    lat_min = config.lat_min
-    lon_max = config.lon_max
-    lon_min = config.lon_min
-    input_path = config.input_path
-    target_path = config.target_path
-    output_path = config.output_path
-    infor = config.infor
-    gname = config.gname
-    period = config.period
-    cinfor = config.cinfor
-    sinfor = config.sinfor
-    version = config.version
-    input_variables = config.input_variables
-    target_variables = config.target_variables
-    var_interp = config.var_interp
-
-    # Create output directory if it doesn't exist
-    os.makedirs(output_path, exist_ok=True)
-
-    # Define patterns to match files from the current and previous year
-    current_year_pattern = f"{year}*.nc"
-    selected_variables = [var_interp, "ta"]
-
-    # Glob patterns for target files, considering the necessary period from the previous year
-    target_files = {
-        var: sorted(
-            glob.glob(
-                f"{target_path}/{infor}/{var}/{sinfor}/{version}/{var}_{infor}_{gname}_{period}_{cinfor}_{sinfor}_*{current_year_pattern}"
-            )
-        )
-        for var in selected_variables
-    }
-
-    # for month in range(1, 13):  # Loop through all months
-    # Load the target grid with preprocessing
-    target_grids = {}
-    for var in selected_variables:
-        # Load the dataset combining files by coordinates
-        # ds = xr.open_mfdataset(
-        #     target_files[var],
-        #     combine="by_coords",
-        #     chunks={
-        #         "time": "auto",
-        #         "lev": "auto",
-        #         "lat": "auto",
-        #         "lon": "auto",
-        #     },
-        # )
-        ds = robust_open_dataset(target_files[var])
-
-        # Select data for a specific month and year
-        # Ensure time decoding is correct (if not automatically handled by xarray)
-        ds = xr.decode_cf(ds)
-        selected_ds = ds.sel(time=(ds["time"].dt.year == year))
-        selected_ds["lat"] = selected_ds["lat"].clip(-90, 90)
-
-        # Check if any data is selected to prevent processing empty datasets
-        if selected_ds.sizes["time"] == 0:
-            raise ValueError(f"No data available for {year} in variable {var}.")
-
-        # Store the selected dataset in the dictionary
-        target_grids[var] = selected_ds
-
-    ## GCM data
-    if gname == "ACCESS-ESM1-5":  # ACCESS-ESM1-5 is hybrid height coordinate
-        target_z_files = f"{target_path}/fx/zfull/{sinfor}/{version}/zfull_fx_{gname}_{period}_{cinfor}_{sinfor}.nc"
-        target_zfull = xr.open_dataset(
-            target_z_files,
-            chunks={"time": "auto", "lev": -1, "lat": "auto", "lon": "auto"},
-        )
-
-    else:
-        # Use hypsometric equation to calculate geopotential height
-        target_ds = target_grids["ta"]
-        target_p = calculate_pressure_levels(target_ds.ap, target_ds.b, target_ds.ps)
-
-        target_zfull = calculate_geopotential_height(
-            target_p, target_ds.ta
-        )  # Calculate geopotential height
-
-        target_zfull = target_zfull.chunk({"time": 10, "lev": -1, "lat": -1, "lon": -1})
-        target_zfull = target_zfull.transpose("time", "lev", "lat", "lon")
-
-    ## Reanalysis data
-
-    # Prepare target files mapping
-    input_z_files = f"{input_path}/z/{year}/z_era5_oper_pl_{year}*.nc"
-
-    # Load era5 geopotential data
-    # era5_z_data = xr.open_mfdataset(
-    #     input_z_files,
-    #     combine="by_coords",
-    #     chunks={
-    #         "time": "auto",
-    #         "level": "auto",
-    #         "latitude": "auto",
-    #         "longitude": "auto",
-    #     },
-    # )
-    era5_z_data = robust_open_dataset(input_z_files)
-
-    # resample and remap era5 geopotential data
-    era5_z_data = correct_latitudes(era5_z_data)
-    g_era5_resampled = era5_z_data.resample(time="6h").mean()
-
-    # Load ended
-    if var_interp == "hus":
-        var_obs = "q"
-    elif var_interp == "ta":
-        var_obs = "t"
-    elif var_interp == "ua":
-        var_obs = "u"
-    elif var_interp == "va":
-        var_obs = "v"
-
-    ## Loop through each variable for interpolation (q, t, u, v)
-    for input_var, target_var in zip([var_obs], [var_interp]):
-        input_files_pattern = (
-            f"{input_path}/{input_var}/{year}/{input_var}_*_{year}*.nc"
-        )
-        output_file = f"{output_path}/{target_var}_era5_oper_pl_regridded_{year}.nc"
-
-        method = "conservative" if input_var == "q" else "bilinear"
-
-        # Load source data
-        # ds = xr.open_mfdataset(
-        #     input_files_pattern,
-        #     combine="by_coords",
-        #     chunks={
-        #         "time": "auto",
-        #         "level": "auto",
-        #         "latitude": "auto",
-        #         "longitude": "auto",
-        #     },
-        # )
-        ds = robust_open_dataset(input_files_pattern)
-
-        ds_corrected = correct_latitudes(ds)
-        ds_resampled = ds_corrected.resample(time="6h").mean()
-
-        # Load the target_grid and input_var
-        target_ds = target_grids[target_var]
-        weights_path = f"{output_path}/weights_{target_var}_{gname}_{method}.nc"
-        rename_dict = {input_var: target_var}
-
-        # Regrid
-        # Original resampled data
-        ds_regridded = regrid(
-            ds_resampled, target_ds, method, weights_path, rename_dict
-        )
-        # Rechunk
-        ds_regridded = ds_regridded.chunk(
-            {"time": 10, "level": -1, "lat": -1, "lon": -1}
-        )
-        # print(
-        #     f"Horizontal interpolation for {input_var} {year}-{month:02} complete."
-        # )
-        # print("Horizontal interpolation complete")
-
-        weights_path_z = f"{output_path}/weights_zfull_era5_oper_pl_{gname}_bilinear.nc"
-        rename_dict_z = {"z": "zfull"}
-
-        ## Vertical interpolation input ----------------------------
-        # Geopotential height
-        if target_var == "va":
-            weights_path_va = (
-                f"{output_path}/weights_zfull_va_era5_oper_pl_{gname}_bilinear.nc"
-            )
-            g_era5_regridded = regrid(
-                g_era5_resampled,
-                target_ds,
-                "bilinear",
-                weights_path_va,
-                rename_dict_z,
-            )
-        else:
-            g_era5_regridded = regrid(
-                g_era5_resampled,
-                target_ds,
-                "bilinear",
-                weights_path_z,
-                rename_dict_z,
-            )
-
-        # Perform calculations
-        g_era5 = g_era5_regridded["zfull"]  # Assuming 'zfull' is geopotential height
-        Z_era5 = geopotential_to_geopotential_height(g_era5)
-
-        # Rechunk
-        Z_era5 = Z_era5.chunk({"time": 10, "level": -1, "lat": -1, "lon": -1})
-
-        # print(
-        #     f"Horizontal interpolation for z {year}-{month:02} complete."
-        # )
-        ## Vertical interpolation input end -------------------------
-        # print("Start vertical interpolation")
-        # Vertical interpolation
-
-        if target_var in ["ua", "va"]:
-            weights_path_wind = (
-                f"{output_path}/weights_{target_var}_{gname}_wind_{method}.nc"
-            )
-            gcm_z_data_interp = regrid(
-                target_zfull,
-                target_ds,
-                method,
-                weights_path_wind,
-                {"zfull": "zfull"},
-            )
-            gcm_z_data_interp = gcm_z_data_interp.chunk(
-                {"lev": -1, "lat": -1, "lon": -1}
-            )
-            interpolated_ds = vertical_interpolation(
-                ds_regridded[target_var], Z_era5, gcm_z_data_interp
-            )
-        else:
-            interpolated_ds = vertical_interpolation(
-                ds_regridded[target_var], Z_era5, target_zfull
-            )
-
-        # print(
-        #     f"Vertical interpolation for {input_var} {year}-{month:02} complete."
-        # )
-
-        interpolated_ds = interpolated_ds.transpose("time", "lev", "lat", "lon")
-        # print("interpolated_ds: ", interpolated_ds)
-
-        interpolated_era5_da = xr.DataArray(
-            interpolated_ds,
-            dims=["time", "lev", "lat", "lon"],
-            coords={
-                "time": interpolated_ds.time,
-                "lev": interpolated_ds.lev,
-                "lat": interpolated_ds.lat,
-                "lon": interpolated_ds.lon,
-            },
-            name=target_var,
-        )
-
-        original_attrs = ds_regridded.attrs.copy()
-
-        interpolated_era5_da.attrs = original_attrs
-        interpolated_era5_da.attrs["interpolation_to"] = f"{gname}"
-
-        sliced_obs = interpolated_era5_da.sel(
-            lat=slice(lat_min, lat_max),
-            lon=slice(lon_min, lon_max),
-        )
-        sliced_obs = sliced_obs.chunk(
-            {"time": "auto", "lev": "auto", "lat": "auto", "lon": "auto"}
-        )
-        # print(sliced_obs)
-        output_file = f"{output_path}/{target_var}_{gname}_{year}.nc"
-        print("save to netcdf")
-        write_job = sliced_obs.to_netcdf(output_file, compute=False)
-
-        with ProgressBar():
-            print(f"Writing to {output_file}")
-            write_job.compute()
-
-        # Append the processed data for this variable for this month
-        # data_dict[target_var].append(interpolated_era5_da)
-
-    print(f"Interpolation for {year} complete")
-    # client.close()
+    return new_ds
 
 
 # End of the functions -------------------------------------------------------
@@ -723,18 +443,28 @@ def main(config):
     input_path = config.input_path
     target_path = config.target_path
     output_path = config.output_path
+    input_z_path = config.input_z_path
     infor = config.infor
     gname = config.gname
     period = config.period
     cinfor = config.cinfor
     sinfor = config.sinfor
     version = config.version
+    input_infor = config.input_infor
+    input_gname = config.input_gname
+    input_period = config.input_period
+    input_cinfor = config.input_cinfor
+    input_sinfor = config.input_sinfor
+    input_version = config.input_version
+    input_model = config.input_model
+    target_model = config.target_model
     var_interp = config.var_interp
     start_year = config.startyear_h
     end_year = config.endyear_h
 
     # Create output directory if it doesn't exist
     os.makedirs(output_path, exist_ok=True)
+    # Start yearly loop ---------------------------------------------
     for year in range(start_year, end_year + 1):
 
         # Define patterns to match files from the current and previous year
@@ -745,32 +475,32 @@ def main(config):
         target_files = {
             var: sorted(
                 glob.glob(
-                    f"{target_path}/{infor}/{var}/{sinfor}/{version}/{var}_{infor}_{gname}_{period}_{cinfor}_{sinfor}_*{current_year_pattern}"
+                    f"{target_path}/{infor}/{var}/{sinfor}/{version}/{var}_*{current_year_pattern}"
                 )
             )
             for var in selected_variables
         }
-
+        # Start monthly loop ----------------------------------------
         for month in range(1, 13):  # Loop through all months
             # Load the target grid with preprocessing
             target_grids = {}
             for var in selected_variables:
                 # Load the dataset combining files by coordinates
-                # ds = robust_open_dataset(target_files[var])
+                with xr.open_dataset(target_files[var][0]) as temp_ds:
+                    # Determine chunking strategy based on dimensions
+                    chunks = {dim: "auto" for dim in temp_ds.dims}
+
                 ds = xr.open_mfdataset(
                     target_files[var],
                     combine="by_coords",
-                    chunks={
-                        "time": "auto",
-                        "lev": "auto",
-                        "lat": "auto",
-                        "lon": "auto",
-                    },
+                    chunks=chunks,
                 )
+                # Rename the coordinates if necessary
+                # ds = standardize_dims(ds)
+
                 # Select data for a specific month and year
                 # Ensure time decoding is correct (if not automatically handled by xarray)
                 ds = xr.decode_cf(ds)
-                # selected_ds = ds.sel(time=(ds["time"].dt.year == year))
                 selected_ds = ds.sel(
                     time=(ds["time"].dt.year == year) & (ds["time"].dt.month == month)
                 )
@@ -785,15 +515,20 @@ def main(config):
                 # Store the selected dataset in the dictionary
                 target_grids[var] = selected_ds
 
-            ## GCM data
-            if gname == "ACCESS-ESM1-5":  # ACCESS-ESM1-5 is hybrid height coordinate
+            ## Target Z data load -------------------------------------
+            if (
+                target_grids[var].lev.standard_name == "hybrid height coordinate"
+            ):  # ACCESS is hybrid height coordinate
                 target_z_files = f"{target_path}/fx/zfull/{sinfor}/{version}/zfull_fx_{gname}_{period}_{cinfor}_{sinfor}.nc"
                 target_zfull = xr.open_dataset(
                     target_z_files,
                     chunks={"time": 10, "lev": -1, "lat": -1, "lon": -1},
                 )
 
-            else:
+            elif (
+                target_grids[var].lev.standard_name
+                == "atmosphere_hybrid_sigma_pressure_coordinate"
+            ):
                 # Use hypsometric equation to calculate geopotential height
                 target_ds = target_grids["ta"]
                 target_p = calculate_pressure_levels(
@@ -809,70 +544,117 @@ def main(config):
                 )
                 target_zfull = target_zfull.transpose("time", "lev", "lat", "lon")
                 target_zfull_per = target_zfull.persist()
-            ## Reanalysis data
+            ## Target Z data load end ---------------------------------
+
+            ## Input Z data load --------------------------------------
 
             # Prepare target files mapping
-            # input_z_files = f"{input_path}/z/{year}/z_era5_oper_pl_{year}*.nc"
-            input_z_files = f"{input_path}/z/{year}/z_era5_oper_pl_{year}{month:02}*-{year}{month:02}*.nc"
+            input_z_files = glob.glob(f"{input_z_path}/{year}/*{year}*.nc")
+            # input_z_files = f"{input_path}/z/{year}/z_era5_oper_pl_{year}{month:02}*-{year}{month:02}*.nc"
+            # input_z_files = f"{input_z_path}/{year}/z_era5_oper_pl_{year}{month:02}*.nc"
 
-            # Load era5 geopotential data
-            # era5_z_data = robust_open_dataset(input_z_files)
+            # Load input geopotential data
+            with xr.open_dataset(input_z_files[0]) as temp_ds:
+                # Determine chunking strategy based on dimensions
+                chunks = {dim: "auto" for dim in temp_ds.dims}
+
             era5_z_data = xr.open_mfdataset(
                 input_z_files,
                 combine="by_coords",
-                chunks={
-                    "time": "auto",
-                    "level": "auto",
-                    "latitude": "auto",
-                    "longitude": "auto",
-                },
+                chunks=chunks,
             )
-            # resample and remap era5 geopotential data
+
+            era5_z_data = standardize_coords(era5_z_data)
+
+            # resample input geopotential data
             era5_z_data = correct_latitudes(era5_z_data)
-            g_era5_resampled = era5_z_data.resample(time="6h").mean()
+            era5_z_data = era5_z_data.sel(
+                time=(era5_z_data["time"].dt.year == year)
+                & (era5_z_data["time"].dt.month == month)
+            )
+            g_era5_resampled = era5_z_data.sel(
+                time=era5_z_data.time.dt.hour.isin([0, 6, 12, 18])
+            )
 
-            # Load ended
-            if var_interp == "hus":
-                var_obs = "q"
-            elif var_interp == "ta":
-                var_obs = "t"
-            elif var_interp == "ua":
-                var_obs = "u"
-            elif var_interp == "va":
-                var_obs = "v"
+            ## Input Z data load end ----------------------------------
 
-            ## Loop through each variable for interpolation (q, t, u, v)
+            # Obs variable name mapping
+            if input_model == "reanalysis":
+                if var_interp == "hus":
+                    var_obs = "q"
+                elif var_interp == "ta":
+                    var_obs = "t"
+                elif var_interp == "ua":
+                    var_obs = "u"
+                elif var_interp == "va":
+                    var_obs = "v"
+            else:
+                var_obs = var_interp
+
+            ## Loop through each variable for interpolation ------------
             for input_var, target_var in zip([var_obs], [var_interp]):
                 # input_files_pattern = (
                 #     f"{input_path}/{input_var}/{year}/{input_var}_*_{year}*.nc"
                 # )
                 # output_file = f"{output_path}/{target_var}_era5_oper_pl_regridded_{year}.nc"
-                input_files_pattern = f"{input_path}/{input_var}/{year}/{input_var}_*_{year}{month:02d}*.nc"
-                output_file = f"{output_path}/{target_var}_era5_oper_pl_regridded_{year}{month:02}.nc"
-
+                # Interpolation method
                 method = "conservative" if input_var == "q" else "bilinear"
 
-                # ds = robust_open_dataset(input_files_pattern)
+                # Load input atmospheric variables ------------------
+                if input_model == "reanalysis":
+                    input_files_pattern = glob.glob(
+                        f"{input_path}/{input_var}/{year}/{input_var}_*_{year}{month:02d}*.nc"
+                    )
+                    # Set output file path
+                    output_file = f"{output_path}/{target_var}_regridded_{input_model}_to_{gname}_{year}{month:02}.nc"
+                    weights_path = f"{output_path}/weights_{input_model}_to_{gname}_{target_var}_{method}.nc"
+                    weights_path_z = f"{output_path}/weights_zfull_{input_model}_to_{gname}_bilinear.nc"
+                    weights_path_va = f"{output_path}/weights_zfull_va_{input_model}_to_{gname}_bilinear.nc"
+                    weights_path_wind = f"{output_path}/weights_{target_var}_{input_model}_to_{gname}_wind_{method}.nc"
+                    output_file = f"{output_path}/{target_var}_{input_model}_to_{gname}_{year}-{month:02}.nc"
+                elif input_model == "gcm":
+                    input_files_pattern = glob.glob(
+                        f"{input_path}/{infor}/{var}/{sinfor}/{version}/{var}_*{current_year_pattern}"
+                    )
+                    # Set output file path
+                    output_file = f"{output_path}/{target_var}_regridded_{input_gname}_to_{gname}_{year}{month:02}.nc"
+                    weights_path = f"{output_path}/weights_{input_gname}_to_{gname}_{target_var}_{method}.nc"
+                    weights_path_z = f"{output_path}/weights_zfull_{input_gname}_to_{gname}_bilinear.nc"
+                    weights_path_va = f"{output_path}/weights_zfull_va_{input_gname}_to_{gname}_bilinear.nc"
+                    weights_path_wind = f"{output_path}/weights_{target_var}_{input_gname}_to_{gname}_wind_{method}.nc"
+                    output_file = f"{output_path}/{target_var}_{input_gname}_to_{gname}_{year}-{month:02}.nc"
+                # Load the dataset combining files by coordinates
+                with xr.open_dataset(input_files_pattern[0]) as temp_ds:
+                    # Determine chunking strategy based on dimensions
+                    chunks = {dim: "auto" for dim in temp_ds.dims}
+
                 ds = xr.open_mfdataset(
                     input_files_pattern,
                     combine="by_coords",
-                    chunks={
-                        "time": "auto",
-                        "level": "auto",
-                        "latitude": "auto",
-                        "longitude": "auto",
-                    },
+                    chunks=chunks,
                 )
+
+                ds = standardize_coords(ds)
                 ds_corrected = correct_latitudes(ds)
-                ds_resampled = ds_corrected.resample(time="6h").mean()
+                ds_corrected = ds_corrected.sel(
+                    time=(ds_corrected["time"].dt.year == year)
+                    & (ds_corrected["time"].dt.month == month)
+                )
 
-                # Load the target_grid and input_var
+                ds_resampled = ds_corrected.sel(
+                    time=ds_corrected.time.dt.hour.isin([0, 6, 12, 18])
+                )
+                # Load input atmospheric variables end ----------------
+
+                # Load target atmospheric variables -------------------
                 target_ds = target_grids[target_var]
-                weights_path = f"{output_path}/weights_{target_var}_{gname}_{method}.nc"
+                # weights_path = f"{output_path}/weights_{input_gname}_
+                # to_{gname}_{target_var}_{gname}_{method}.nc"
                 rename_dict = {input_var: target_var}
+                # Load target atmospheric variables end ---------------
 
-                # Regrid
-                # Original resampled data
+                ## Start regrid ---------------------------------------
+                # Horizontal interpolation ----------------------------
                 ds_regridded = regrid(
                     ds_resampled, target_ds, method, weights_path, rename_dict
                 )
@@ -882,23 +664,16 @@ def main(config):
                     lon=slice(lon_min, lon_max),
                 ).chunk({"level": -1})
                 sliced_ds_per = sliced_ds.persist()
-                # ds_regridded = ds_regridded.chunk(
-                #     {"time": 10, "level": -1, "lat": -1, "lon": -1}
-                # )
-                # print(
-                #     f"Horizontal interpolation for {input_var} {year}-{month:02} complete."
-                # )
-                # print("Horizontal interpolation complete")
 
-                weights_path_z = (
-                    f"{output_path}/weights_zfull_era5_oper_pl_{gname}_bilinear.nc"
+                print(
+                    f"Horizontal interpolation for {input_var} {year}-{month:02} complete."
                 )
-                rename_dict_z = {"z": "zfull"}
+                old_var_name = list(era5_z_data.data_vars)[0]
+                rename_dict_z = {old_var_name: "zfull"}
 
                 ## Vertical interpolation input ----------------------------
                 # Geopotential height
                 if target_var == "va":
-                    weights_path_va = f"{output_path}/weights_zfull_va_era5_oper_pl_{gname}_bilinear.nc"
                     g_era5_regridded = regrid(
                         g_era5_resampled,
                         target_ds,
@@ -929,16 +704,13 @@ def main(config):
                 # Z_era5 = Z_era5.chunk({"time": 10, "level": -1, "lat": -1, "lon": -1})
                 Z_era5_per = Z_era5.persist()
                 Z_era5_per = Z_era5_per.chunk({"level": -1})
-                # print(
-                #     f"Horizontal interpolation for z {year}-{month:02} complete."
-                # )
-                ## Vertical interpolation input end -------------------------
+                print(f"Horizontal interpolation for z {year}-{month:02} complete.")
+                # Horitonztal interpolation end -----------------------
+
+                # Vertical interpolation ------------------------------
                 # print("Start vertical interpolation")
-                # Vertical interpolation
                 if target_var in ["ua", "va"]:
-                    weights_path_wind = (
-                        f"{output_path}/weights_{target_var}_{gname}_wind_{method}.nc"
-                    )
+                    # Need to horizontal regrid for the specific variable which are not located in the centre of grid cells
                     gcm_z_data_interp = regrid(
                         target_zfull_per,
                         target_ds,
@@ -968,15 +740,15 @@ def main(config):
 
                 sliced_interpolated_ds_per = interpolated_ds.persist()
 
-                # print(
-                #     f"Vertical interpolation for {input_var} {year}-{month:02} complete."
-                # )
+                print(
+                    f"Vertical interpolation for {input_var} {year}-{month:02} complete."
+                )
                 sliced_interpolated_ds_per = sliced_interpolated_ds_per.transpose(
                     "time", "lev", "lat", "lon"
                 )
-                # interpolated_ds = interpolated_ds.transpose("time", "lev", "lat", "lon")
-                # print("interpolated_ds: ", interpolated_ds)
+                # Vertical interpolation end --------------------------
 
+                # Create the final DataArray with the interpolated data
                 interpolated_era5_da = xr.DataArray(
                     sliced_interpolated_ds_per,
                     dims=["time", "lev", "lat", "lon"],
@@ -994,16 +766,7 @@ def main(config):
                 interpolated_era5_da.attrs = original_attrs
                 interpolated_era5_da.attrs["interpolation_to"] = f"{gname}"
 
-                # sliced_obs = interpolated_era5_da.sel(
-                #     lat=slice(lat_min, lat_max),
-                #     lon=slice(lon_min, lon_max),
-                # )
-                # sliced_obs = sliced_obs.chunk(
-                #     {"time": "auto", "lev": "auto", "lat": "auto", "lon": "auto"}
-                # )
-                # print(sliced_obs)
-                # output_file = f"{output_path}/{target_var}_{gname}_{year}.nc"
-                output_file = f"{output_path}/{target_var}_{gname}_{year}-{month:02}.nc"
+                # output_file = f"{output_path}/{target_var}_{gname}_{year}-{month:02}.nc"
                 print("save to netcdf")
                 write_job = interpolated_era5_da.to_netcdf(output_file, compute=False)
 
@@ -1011,8 +774,9 @@ def main(config):
                     print(f"Writing to {output_file}")
                     write_job.compute()
 
-                # Append the processed data for this variable for this month
-                # data_dict[target_var].append(interpolated_era5_da)
+                print(
+                    f"Saved regridded data for {target_var} {year}-{month:02} to {output_file}"
+                )
 
             print(f"Interpolation for year: {year} month: {month:02} complete")
 
@@ -1021,12 +785,7 @@ if __name__ == "__main__":
     args = parse_arguments()
     config = load_config(args.yp)
     config.var_interp = args.var
-    config.num_cores = args.nc
-    config.memory = args.mp
     config.startyear_h = args.sy
     config.endyear_h = args.ey
-    # config.num_processes = args.np
-    # config.memory_per_process = args.mpp
-    # config.num_cores_per_process = args.nc // args.np  # Distribute cores evenly
     main(config)
     print("All done!")
