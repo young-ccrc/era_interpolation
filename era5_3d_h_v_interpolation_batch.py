@@ -17,9 +17,7 @@ Contact: youngil.kim@unsw.edu.au
 
 import argparse
 import glob
-import logging
 import os
-import sys
 import warnings
 
 # from multiprocessing import Pool
@@ -204,9 +202,18 @@ def calculate_pressure_levels(ap, b, ps):
     return p_levels
 
 
-def calculate_geopotential_height(p_levels, T_levels):
+def compute_geopotential_height(p_levels, T_levels, q_levels=None):
     Rd = 287.05  # J/kg/K, specific gas constant for dry air
     g = 9.80665  # m/s^2, acceleration due to gravity
+
+    # Ensure T_levels and q_levels are DataArrays for compatibility with xarray operations
+    if isinstance(T_levels, xr.DataArray):
+        T_levels = T_levels
+    else:
+        T_levels = xr.DataArray(T_levels)
+
+    if q_levels is not None and not isinstance(q_levels, xr.DataArray):
+        q_levels = xr.DataArray(q_levels)
 
     # Compute the pressure ratio without aligning by levels
     upper_p = p_levels.isel(lev=slice(None, -1)).data
@@ -237,13 +244,25 @@ def calculate_geopotential_height(p_levels, T_levels):
         dims=["time", "lev", "lat", "lon"],
         coords=log_p_ratio_da.coords,  # Match coordinates with log_p_ratio_da
     )
+    if q_levels is not None:
+        # Compute moist temperature
+        upper_q = q_levels.isel(lev=slice(None, -1)).data
+        lower_q = q_levels.isel(lev=slice(1, None)).data
+        mean_q = (upper_q + lower_q) / 2
+        # Re-create the DataArray for mean_T with adjusted coordinates
+        mean_q_da = xr.DataArray(
+            mean_q,
+            dims=["time", "lev", "lat", "lon"],
+            coords=log_p_ratio_da.coords,  # Match coordinates with log_p_ratio_da
+        )
+        mean_T_da = mean_T_da * (1.0 + 0.609133 * mean_q_da)
 
     # Calculate thickness of each layer (delta Z)
     delta_Z = (Rd / g) * mean_T_da * log_p_ratio_da
 
     # Integrate delta_Z from the top to obtain geopotential heights
     Z_levels_cumsum = delta_Z.cumsum(dim="lev")
-
+    print("z_levels_cumsum", Z_levels_cumsum)
     # Add an extra level at the top with zero or extrapolated geopotential height
     top_level = da.zeros(
         (
@@ -300,9 +319,33 @@ def adjust_geopotential_heights(Z_interior, original_levs):
     return Z_full
 
 
+def custom_interp(x_new, interp_func, x_min, x_max):
+    """
+    Custom interpolation function that extrapolates for lower bounds and fills NaN for upper bounds.
+
+    Args:
+        x_new (array-like): The target levels to interpolate the source profile to.
+        interp_func (callable): The interpolation function.
+        x_min (float): The minimum value of the original x data.
+        x_max (float): The maximum value of the original x data.
+
+    Returns:
+        array-like: The interpolated values with custom handling for extrapolation.
+    """
+    y_new = interp_func(x_new)
+    # Identify indices where extrapolation happens
+    lower_bound = x_new < x_min
+    upper_bound = x_new > x_max
+
+    # Fill NaN for upper bound
+    y_new[upper_bound] = np.nan
+
+    return y_new
+
+
 def interpolate_profile(source_profile, source_levels, target_levels):
     """
-    Interpolates a source profile to match target levels.
+    Interpolates a source profile to match target levels with custom handling for extrapolation.
 
     Args:
         source_profile (array-like): The source profile to be interpolated.
@@ -312,8 +355,16 @@ def interpolate_profile(source_profile, source_levels, target_levels):
     Returns:
         array-like: The interpolated profile matching the target levels.
     """
-    f_interp = interp1d(source_levels, source_profile, bounds_error=False, fill_value="extrapolate")  # type: ignore
-    return f_interp(target_levels)
+    # Create the interpolation function with 'extrapolate' mode
+    f_interp = interp1d(
+        source_levels, source_profile, bounds_error=False, fill_value="extrapolate"
+    )
+
+    # Get the min and max of source levels
+    x_min = np.min(source_levels)
+    x_max = np.max(source_levels)
+
+    return custom_interp(target_levels, f_interp, x_min, x_max)
 
 
 # Assuming ds_regridded, Z_era5, and gcm_z_data are xarray DataArrays/Datasets with Dask arrays
@@ -469,7 +520,8 @@ def main(config):
 
         # Define patterns to match files from the current and previous year
         current_year_pattern = f"{year}*.nc"
-        selected_variables = [var_interp, "ta"]
+        selected_variables = [var_interp]
+        tq_variables = ["ta", "hus"]
 
         # Glob patterns for target files, considering the necessary period from the previous year
         target_files = {
@@ -479,6 +531,14 @@ def main(config):
                 )
             )
             for var in selected_variables
+        }
+        tq_files = {
+            var: sorted(
+                glob.glob(
+                    f"{target_path}/{infor}/{var}/{sinfor}/{version}/{var}_*{current_year_pattern}"
+                )
+            )
+            for var in tq_variables
         }
         # Start monthly loop ----------------------------------------
         for month in range(1, 13):  # Loop through all months
@@ -495,9 +555,6 @@ def main(config):
                     combine="by_coords",
                     chunks=chunks,
                 )
-                # Rename the coordinates if necessary
-                # ds = standardize_dims(ds)
-
                 # Select data for a specific month and year
                 # Ensure time decoding is correct (if not automatically handled by xarray)
                 ds = xr.decode_cf(ds)
@@ -515,9 +572,37 @@ def main(config):
                 # Store the selected dataset in the dictionary
                 target_grids[var] = selected_ds
 
+            tq_grids = {}
+            for var in tq_variables:
+                # Load the dataset combining files by coordinates
+                with xr.open_dataset(tq_files[var][0]) as temp_ds:
+                    # Determine chunking strategy based on dimensions
+                    chunks = {dim: "auto" for dim in temp_ds.dims}
+                dtq = xr.open_mfdataset(
+                    tq_files[var],
+                    combine="by_coords",
+                    chunks=chunks,
+                )
+                # Select data for a specific month and year
+                # Ensure time decoding is correct (if not automatically handled by xarray)
+                dtq = xr.decode_cf(dtq)
+                selected_dtq = dtq.sel(
+                    time=(dtq["time"].dt.year == year) & (dtq["time"].dt.month == month)
+                )
+                selected_dtq["lat"] = selected_dtq["lat"].clip(-90, 90)
+
+                # Check if any data is selected to prevent processing empty datasets
+                if selected_dtq.sizes["time"] == 0:
+                    raise ValueError(
+                        f"No data available for {year}-{month} in variable {var}."
+                    )
+
+                # Store the selected dataset in the dictionary
+                tq_grids[var] = selected_dtq
+
             ## Target Z data load -------------------------------------
             if (
-                target_grids[var].lev.standard_name == "hybrid height coordinate"
+                target_grids[var_interp].lev.standard_name == "hybrid height coordinate"
             ):  # ACCESS is hybrid height coordinate
                 target_z_files = f"{target_path}/fx/zfull/{sinfor}/{version}/zfull_fx_{gname}_{period}_{cinfor}_{sinfor}.nc"
                 target_zfull = xr.open_dataset(
@@ -526,24 +611,60 @@ def main(config):
                 )
 
             elif (
-                target_grids[var].lev.standard_name
+                target_grids[var_interp].lev.standard_name
                 == "atmosphere_hybrid_sigma_pressure_coordinate"
             ):
-                # Use hypsometric equation to calculate geopotential height
-                target_ds = target_grids["ta"]
-                target_p = calculate_pressure_levels(
-                    target_ds.ap, target_ds.b, target_ds.ps
-                )
+                if config.target_g_path == "None":
+                    print("Compute GCM geopotential height")
+                    # Use hypsometric equation to calculate geopotential height
+                    target_t = tq_grids["ta"]
+                    target_q = tq_grids["hus"]
+                    target_p = calculate_pressure_levels(
+                        target_t.ap, target_t.b, target_t.ps
+                    )
+                    target_zfull = compute_geopotential_height(
+                        target_p, target_t.ta, target_q.hus
+                    )  # Calculate geopotential height
 
-                target_zfull = calculate_geopotential_height(
-                    target_p, target_ds.ta
-                )  # Calculate geopotential height
+                    target_zfull = target_zfull.chunk(
+                        {"time": 10, "lev": -1, "lat": -1, "lon": -1}
+                    )
+                    target_zfull = target_zfull.transpose("time", "lev", "lat", "lon")
+                    target_zfull_per = target_zfull.persist()
+                else:
+                    print("Use exist GCM geopotential height")
+                    target_zg_files = {"zg": []}
+                    for year in range(start_year, end_year + 1):
+                        # Define patterns to match files from the current year
+                        current_year_pattern = f"{year}*.nc"
 
-                target_zfull = target_zfull.chunk(
-                    {"time": 10, "lev": -1, "lat": -1, "lon": -1}
-                )
-                target_zfull = target_zfull.transpose("time", "lev", "lat", "lon")
-                target_zfull_per = target_zfull.persist()
+                        # Generate file path pattern
+                        file_path_pattern = (
+                            f"{config.target_g_path}/*_*{current_year_pattern}"
+                        )
+
+                        # Use glob to find matching files
+                        found_files = sorted(glob.glob(file_path_pattern))
+
+                        # Only append the list of files if it is not empty
+                        if found_files:
+                            target_zg_files["zg"].extend(found_files)
+
+                    target_z = xr.open_dataset(
+                        target_zg_files["zg"],
+                        chunks={"time": 10, "lev": -1, "lat": -1, "lon": -1},
+                    )
+
+                    selected_target_z = target_z.sel(
+                        time=(ds["time"].dt.year == year)
+                        & (ds["time"].dt.month == month)
+                    )
+                    selected_target_z["lat"] = selected_target_z["lat"].clip(-90, 90)
+                    for var in list(selected_target_z.data_vars):
+                        if var in rename_dict:
+                            target_zfull = selected_target_z.rename({var: "zfull"})
+                    target_zfull_per = target_zfull.persist()
+
             ## Target Z data load end ---------------------------------
 
             ## Input Z data load --------------------------------------
@@ -614,7 +735,7 @@ def main(config):
                     output_file = f"{output_path}/{target_var}_{input_model}_to_{gname}_{year}-{month:02}.nc"
                 elif input_model == "gcm":
                     input_files_pattern = glob.glob(
-                        f"{input_path}/{infor}/{var}/{sinfor}/{version}/{var}_*{current_year_pattern}"
+                        f"{input_path}/{input_infor}/{var}/{input_sinfor}/{input_version}/{var}_*{current_year_pattern}"
                     )
                     # Set output file path
                     output_file = f"{output_path}/{target_var}_regridded_{input_gname}_to_{gname}_{year}{month:02}.nc"
@@ -623,6 +744,7 @@ def main(config):
                     weights_path_va = f"{output_path}/weights_zfull_va_{input_gname}_to_{gname}_bilinear.nc"
                     weights_path_wind = f"{output_path}/weights_{target_var}_{input_gname}_to_{gname}_wind_{method}.nc"
                     output_file = f"{output_path}/{target_var}_{input_gname}_to_{gname}_{year}-{month:02}.nc"
+
                 # Load the dataset combining files by coordinates
                 with xr.open_dataset(input_files_pattern[0]) as temp_ds:
                     # Determine chunking strategy based on dimensions
@@ -737,8 +859,14 @@ def main(config):
                     interpolated_ds = vertical_interpolation(
                         sliced_ds_per[target_var], Z_era5_per, sliced_target_zfull
                     )
-
-                sliced_interpolated_ds_per = interpolated_ds.persist()
+                # Values exceeds the maximum level of obs model (up to stratosphere) are filled with the values of target model
+                # with assuming that the changes of the values in mesosphere are negligible in RCM simulations.
+                interpolated_ds_adjusted = xr.where(
+                    interpolated_ds.isnull(),
+                    target_ds[target_var],
+                    interpolated_ds,
+                )
+                sliced_interpolated_ds_per = interpolated_ds_adjusted.persist()
 
                 print(
                     f"Vertical interpolation for {input_var} {year}-{month:02} complete."
