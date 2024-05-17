@@ -622,10 +622,13 @@ def main(config):
                     target_p = calculate_pressure_levels(
                         target_t.ap, target_t.b, target_t.ps
                     )
+                    # target_zfull = compute_geopotential_height(
+                    #     target_p, target_t.ta, target_q.hus
+                    # )  # Calculate geopotential height
                     target_zfull = compute_geopotential_height(
-                        target_p, target_t.ta, target_q.hus
-                    )  # Calculate geopotential height
-
+                        target_p, target_t.ta
+                    # )  # Calculate geopotential height
+                        
                     target_zfull = target_zfull.chunk(
                         {"time": 10, "lev": -1, "lat": -1, "lon": -1}
                     )
