@@ -262,7 +262,7 @@ def compute_geopotential_height(p_levels, T_levels, q_levels=None):
 
     # Integrate delta_Z from the top to obtain geopotential heights
     Z_levels_cumsum = delta_Z.cumsum(dim="lev")
-    print("z_levels_cumsum", Z_levels_cumsum)
+    
     # Add an extra level at the top with zero or extrapolated geopotential height
     top_level = da.zeros(
         (
