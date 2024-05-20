@@ -602,13 +602,18 @@ def main(config):
 
             ## Target Z data load -------------------------------------
             if (
-                target_grids[var_interp].lev.standard_name == "hybrid height coordinate"
+                target_grids[var_interp].lev.standard_name
+                == "atmosphere_hybrid_height_coordinate"
             ):  # ACCESS is hybrid height coordinate
                 target_z_files = f"{target_path}/fx/zfull/{sinfor}/{version}/zfull_fx_{gname}_{period}_{cinfor}_{sinfor}.nc"
                 target_zfull = xr.open_dataset(
                     target_z_files,
-                    chunks={"time": 10, "lev": -1, "lat": -1, "lon": -1},
+                    chunks={"lev": -1, "lat": -1, "lon": -1},
                 )
+                target_zfull = target_zfull["zfull"].transpose(
+                    "lev", "lat", "lon"
+                )
+                target_zfull_per = target_zfull.persist()
 
             elif (
                 target_grids[var_interp].lev.standard_name
