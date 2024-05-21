@@ -869,9 +869,14 @@ def main(config):
                     )
                 # Values exceeds the maximum level of obs model (up to stratosphere) are filled with the values of target model
                 # with assuming that the changes of the values in mesosphere are negligible in RCM simulations.
+                sliced_target_ds = target_ds.sel(
+                    lat=slice(lat_min, lat_max),
+                    lon=slice(lon_min, lon_max),
+                ).chunk({"lev": -1})
+                
                 interpolated_ds_adjusted = xr.where(
                     interpolated_ds.isnull(),
-                    target_ds[target_var],
+                    sliced_target_ds[target_var],
                     interpolated_ds,
                 )
                 sliced_interpolated_ds_per = interpolated_ds_adjusted.persist()
